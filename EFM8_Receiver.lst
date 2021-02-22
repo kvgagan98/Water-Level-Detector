@@ -1,0 +1,758 @@
+0000              1   ; EFM8_Receiver.asm:  This program implements a simple serial port
+0000              2   ; communication protocol to program, verify, and read an SPI flash memory.  Since
+0000              3   ; the program was developed to store wav audio files, it also allows 
+0000              4   ; for the playback of said audio.  It is assumed that the wav sampling rate is
+0000              5   ; 22050Hz, 8-bit, mono.
+0000              6   ;
+0000              7   ; Connections:
+0000              8   ; 
+0000              9   ; EFM8 board  SPI_FLASH
+0000             10   ; P0.0        Pin 6 (SPI_CLK)
+0000             11   ; P0.1        Pin 2 (MISO)
+0000             12   ; P0.2        Pin 5 (MOSI)
+0000             13   ; P0.3        Pin 1 (CS/)
+0000             14   ; GND         Pin 4
+0000             15   ; 3.3V        Pins 3, 7, 8  (The MCP1700 3.3V voltage regulator or similar is required)
+0000             16   ;
+0000             17   ; P3.0 is the DAC output which should be connected to the input of power amplifier (LM386 or similar)
+0000             18   ;
+0000             19   
+                 21   $LIST
+0000             23   
+0000             24   SYSCLK         EQU 72000000  ; Microcontroller system clock frequency in Hz
+0000             25   TIMER2_RATE    EQU 22050     ; 22050Hz is the sampling rate of the wav file we are playing
+0000             26   TIMER2_RELOAD  EQU 0x10000-(SYSCLK/TIMER2_RATE)
+0000             27   F_SCK_MAX      EQU 20000000
+0000             28   BAUDRATE       EQU 115200
+0000             29   
+0000             30   FLASH_CE EQU P0.3
+0000             31   SPEAKER  EQU P1.2
+0000             32   
+0000             33   ; Commands supported by the SPI flash memory according to the datasheet
+0000             34   WRITE_ENABLE     EQU 0x06  ; Address:0 Dummy:0 Num:0
+0000             35   WRITE_DISABLE    EQU 0x04  ; Address:0 Dummy:0 Num:0
+0000             36   READ_STATUS      EQU 0x05  ; Address:0 Dummy:0 Num:1 to infinite
+0000             37   READ_BYTES       EQU 0x03  ; Address:3 Dummy:0 Num:1 to infinite
+0000             38   READ_SILICON_ID  EQU 0xab  ; Address:0 Dummy:3 Num:1 to infinite
+0000             39   FAST_READ        EQU 0x0b  ; Address:3 Dummy:1 Num:1 to infinite
+0000             40   WRITE_STATUS     EQU 0x01  ; Address:0 Dummy:0 Num:1
+0000             41   WRITE_BYTES      EQU 0x02  ; Address:3 Dummy:0 Num:1 to 256
+0000             42   ERASE_ALL        EQU 0xc7  ; Address:0 Dummy:0 Num:0
+0000             43   ERASE_BLOCK      EQU 0xd8  ; Address:3 Dummy:0 Num:0
+0000             44   READ_DEVICE_ID   EQU 0x9f  ; Address:0 Dummy:2 Num:1 to infinite
+0000             45   
+0000             46   ; Variables used in the program:
+0030             47   dseg at 30H
+0030             48            w:   ds 3 ; 24-bit play counter.  Decremented in Timer 2 ISR.
+0033             49            x:   ds 4
+0037             50            y:   ds 4
+003B             51            bcd: ds 5
+0040             52   
+0000             53   BSEG
+0000             54   mf: dbit 1
+0001             55   
+0001             56   ; Interrupt vectors:
+0000             57   cseg
+0000             58   
+0000             59   org 0x0000 ; Reset vector
+0000 0205FE      60       ljmp MainProgram
+0003             61   
+0003             62   org 0x0003 ; External interrupt 0 vector (not used in this code)
+0003 32          63            reti
+0004             64   
+000B             65   org 0x000B ; Timer/Counter 0 overflow interrupt vector (not used in this code)
+000B 32          66            reti
+000C             67   
+0013             68   org 0x0013 ; External interrupt 1 vector (not used in this code)
+0013 32          69            reti
+0014             70   
+001B             71   org 0x001B ; Timer/Counter 1 overflow interrupt vector (not used in this code
+001B 32          72            reti
+001C             73   
+0023             74   org 0x0023 ; Serial port receive/transmit interrupt vector (not used in this code)
+0023 32          75            reti
+0024             76   
+005B             77   org 0x005b ; Timer 2 interrupt vector.  Used in this code to replay the wave file.
+005B 0204BC      78            ljmp Timer2_ISR
+005E             79   
+005E             80   LCD_RS equ P2.0
+005E             81   LCD_RW equ P1.7
+005E             82   LCD_E  equ P1.6
+005E             83   LCD_D4 equ P1.1
+005E             84   LCD_D5 equ P1.0
+005E             85   LCD_D6 equ P0.7
+005E             86   LCD_D7 equ P0.6
+                546   $LIST
+                 89   $LIST
+0393             91   
+0393 43617061    92   Msg1:  db 'Capacitance (nF):', 0
+     63697461
+     6E636520
+     286E4629
+     3A00
+03A5             93   
+03A5             94   display_c:
+03A5 7533C0      95            mov x+0, #low (11200 % 0x10000) 
+03A8 75342B      95            mov x+1, #high(11200 % 0x10000) 
+03AB 753500      95            mov x+2, #low (11200 / 0x10000) 
+03AE 753600      95            mov x+3, #high(11200 / 0x10000) 
+03B1 858A37      96       mov y+0, TL0
+03B4 858C38      97       mov y+1, TH0
+03B7 753900      98       mov y+2, #0
+03BA 753A00      99       mov y+3, #0
+03BD 12029D     100       lcall mul32 ; x has Rtotal * frequency
+03C0 753710     101            mov y+0, #low (10000 % 0x10000) 
+03C3 753827     101            mov y+1, #high(10000 % 0x10000) 
+03C6 753900     101            mov y+2, #low (10000 / 0x10000) 
+03C9 753A00     101            mov y+3, #high(10000 / 0x10000)  ; frequency/10000
+03CC 12032A     102       lcall div32
+03CF 853337     103       mov y+0,x+0
+03D2 853438     104       mov y+1,x+1
+03D5 853539     105       mov y+2,x+2
+03D8 85363A     106       mov y+3,x+3
+03DB 753300     107            mov x+0, #low (1440000000 % 0x10000) 
+03DE 7534A8     107            mov x+1, #high(1440000000 % 0x10000) 
+03E1 7535D4     107            mov x+2, #low (1440000000 / 0x10000) 
+03E4 753655     107            mov x+3, #high(1440000000 / 0x10000) 
+03E7 12032A     108       lcall div32
+03EA 120123     109            lcall hex2bcd
+03ED 1203F1     110            lcall Display_formated_BCD
+03F0 22         111            ret
+03F1            112   
+03F1            113   Display_formated_BCD:
+03F1 C0E0       114       push acc
+03F3 E53E       115       mov a,bcd+3
+03F5 C0E0       116            push acc
+03F7 7407       116            mov a, #7
+03F9 14         116            dec a
+03FA 120106     116            lcall ?Set_Cursor_2 ; Select column and row
+03FD D0E0       116            pop acc
+03FF C0E0       117            push acc
+0401 7420       117            mov a, #' '
+0403 1200AE     117            lcall ?WriteData
+0406 D0E0       117            pop acc
+0408 B40027     118       cjne a,#0,here
+040B C000       119            push ar0
+040D A83D       119            mov r0, bcd+2
+040F 12010D     119            lcall ?Display_BCD
+0412 D000       119            pop ar0
+0414 C0E0       120            push acc
+0416 742E       120            mov a, #'.'
+0418 1200AE     120            lcall ?WriteData
+041B D0E0       120            pop acc
+041D C000       121            push ar0
+041F A83C       121            mov r0, bcd+1
+0421 12010D     121            lcall ?Display_BCD
+0424 D000       121            pop ar0
+0426 C000       122            push ar0
+0428 A83B       122            mov r0, bcd+0
+042A 12010D     122            lcall ?Display_BCD
+042D D000       122            pop ar0
+042F D0E0       123       pop acc
+0431 22         124            ret
+0432            125   here:
+0432 C000       126            push ar0
+0434 A83E       126            mov r0, bcd+3
+0436 12010D     126            lcall ?Display_BCD
+0439 D000       126            pop ar0
+043B C000       127            push ar0
+043D A83D       127            mov r0, bcd+2
+043F 12010D     127            lcall ?Display_BCD
+0442 D000       127            pop ar0
+0444 C0E0       128            push acc
+0446 742E       128            mov a, #'.'
+0448 1200AE     128            lcall ?WriteData
+044B D0E0       128            pop acc
+044D C000       129            push ar0
+044F A83C       129            mov r0, bcd+1
+0451 12010D     129            lcall ?Display_BCD
+0454 D000       129            pop ar0
+0456 C000       130            push ar0
+0458 A83B       130            mov r0, bcd+0
+045A 12010D     130            lcall ?Display_BCD
+045D D000       130            pop ar0
+045F D0E0       131       pop acc
+0461 22         132            ret
+0462            133   ; This 'wait' must be as precise as possible. Sadly the 24.5MHz clock in the EFM8LB1 has an accuracy of just 2%.
+0462            134   Wait_one_second:         
+0462            135       ;For a 24.5MHz clock one machine cycle takes 1/24.5MHz=40.81633ns
+0462 7AC6       136       mov R2, #198 ; Calibrate using this number to account for overhead delays
+0464 79F5       137   X3: mov R1, #245
+0466 78A7       138   X2: mov R0, #167
+0468 D8FE       139   X1: djnz R0, X1 ; 3 machine cycles -> 3*40.81633ns*167=20.44898us (see table 10.2 in reference manual)
+046A D9FA       140       djnz R1, X2 ; 20.44898us*245=5.01ms
+046C DAF6       141       djnz R2, X3 ; 5.01ms*198=0.991s + overhead
+046E 22         142       ret
+046F            143   
+046F            144   ;Converts the hex number in TH0-TL0 to packed BCD in R2-R1-R0
+046F            145   hex2bcd_freq:
+046F E4         146            clr a
+0470 7800       147       mov R0, #0  ; Set packed BCD result to 00000 
+0472 7900       148       mov R1, #0
+0474 7A00       149       mov R2, #0
+0476 7B10       150       mov R3, #16 ; Loop counter.
+0478            151       
+0478            152   hex2bcd_L0_freq:
+0478 E58A       153       mov a, TL0 ; Shift TH0-TL0 left through carry
+047A 33         154       rlc a      ; multiply by 2
+047B F58A       155       mov TL0, a ; multiplied result in here
+047D            156       
+047D E58C       157       mov a, TH0
+047F 33         158       rlc a
+0480 F58C       159       mov TH0, a
+0482            160       
+0482            161            ; Perform bcd + bcd + carry
+0482            162            ; using BCD numbers
+0482 E8         163            mov a, R0
+0483 38         164            addc a, R0
+0484 D4         165            da a
+0485 F8         166            mov R0, a
+0486            167            
+0486 E9         168            mov a, R1
+0487 39         169            addc a, R1
+0488 D4         170            da a
+0489 F9         171            mov R1, a
+048A            172            
+048A EA         173            mov a, R2
+048B 3A         174            addc a, R2
+048C D4         175            da a
+048D FA         176            mov R2, a
+048E            177            
+048E DBE8       178            djnz R3, hex2bcd_L0_freq ; decrement and jump if not 0
+0490 22         179            ret
+0491            180   
+0491            181   ; Dumps the 5-digit packed BCD number in R2-R1-R0 into the LCD
+0491            182   DisplayBCD:
+0491            183            ; 5th digit:
+0491 EA         184       mov a, R2
+0492 540F       185       anl a, #0FH
+0494 4430       186       orl a, #'0' ; convert to ASCII
+0496 1200AE     187            lcall ?WriteData
+0499            188            ; 4th digit:
+0499 E9         189       mov a, R1
+049A C4         190       swap a
+049B 540F       191       anl a, #0FH
+049D 4430       192       orl a, #'0' ; convert to ASCII
+049F 1200AE     193            lcall ?WriteData
+04A2            194            ; 3rd digit:
+04A2 E9         195       mov a, R1
+04A3 540F       196       anl a, #0FH
+04A5 4430       197       orl a, #'0' ; convert to ASCII
+04A7 1200AE     198            lcall ?WriteData
+04AA            199            ; 2nd digit:
+04AA E8         200       mov a, R0
+04AB C4         201       swap a
+04AC 540F       202       anl a, #0FH
+04AE 4430       203       orl a, #'0' ; convert to ASCII
+04B0 1200AE     204            lcall ?WriteData
+04B3            205            ; 1st digit:
+04B3 E8         206       mov a, R0
+04B4 540F       207       anl a, #0FH
+04B6 4430       208       orl a, #'0' ; convert to ASCII
+04B8 1200AE     209            lcall ?WriteData
+04BB            210       
+04BB 22         211       ret
+04BC            212   ;-------------------------------------;
+04BC            213   ; ISR for Timer 2.  Used to playback  ;
+04BC            214   ; the WAV file stored in the SPI      ;
+04BC            215   ; flash memory.                       ;
+04BC            216   ;-------------------------------------;
+04BC            217   Timer2_ISR:
+04BC 75A700     218            mov     SFRPAGE, #0x00
+04BF C2CF       219            clr     TF2H ; Clear Timer2 interrupt flag
+04C1            220   
+04C1            221            ; The registers used in the ISR must be saved in the stack
+04C1 C0E0       222            push acc
+04C3 C0D0       223            push psw
+04C5            224            
+04C5            225            ; Check if the play counter is zero.  If so, stop playing sound.
+04C5 E530       226            mov a, w+0
+04C7 4531       227            orl a, w+1
+04C9 4532       228            orl a, w+2
+04CB 6029       229            jz stop_playing
+04CD            230            
+04CD            231            ; Decrement play counter 'w'.  In this implementation 'w' is a 24-bit counter.
+04CD 74FF       232            mov a, #0xff
+04CF 1530       233            dec w+0
+04D1 B53007     234            cjne a, w+0, keep_playing
+04D4 1531       235            dec w+1
+04D6 B53102     236            cjne a, w+1, keep_playing
+04D9 1532       237            dec w+2
+04DB            238            
+04DB            239   keep_playing:
+04DB            240   
+04DB D292       241            setb SPEAKER
+04DD 120511     242            lcall Send_SPI ; Read the next byte from the SPI Flash...
+04E0            243            
+04E0            244            ; It gets a bit complicated here because we read 8 bits from the flash but we need to write 12 bits to DAC:
+04E0 75A730     245            mov SFRPAGE, #0x30 ; DAC registers are in page 0x30
+04E3 C0E0       246            push acc ; Save the value we got from flash
+04E5 C4         247            swap a
+04E6 54F0       248            anl a, #0xf0
+04E8 F584       249            mov DAC0L, a
+04EA D0E0       250            pop acc
+04EC C4         251            swap a
+04ED 540F       252            anl a, #0x0f
+04EF F585       253            mov DAC0H, a
+04F1 75A700     254            mov SFRPAGE, #0x00
+04F4            255            
+04F4 8006       256            sjmp Timer2_ISR_Done
+04F6            257   
+04F6            258   stop_playing:
+04F6 C2CA       259            clr TR2 ; Stop timer 2
+04F8 D283       260            setb FLASH_CE  ; Disable SPI Flash
+04FA C292       261            clr SPEAKER ; Turn off speaker.  Removes hissing noise when not playing sound.
+04FC            262   
+04FC            263   Timer2_ISR_Done:         
+04FC D0D0       264            pop psw
+04FE D0E0       265            pop acc
+0500 32         266            reti
+0501            267   
+0501            268   ;---------------------------------;
+0501            269   ; Sends a byte via serial port    ;
+0501            270   ;---------------------------------;
+0501            271   putchar:
+0501 109902     272            jbc     TI,putchar_L1
+0504 80FB       273            sjmp putchar
+0506            274   putchar_L1:
+0506 F599       275            mov     SBUF,a
+0508 22         276            ret
+0509            277   
+0509            278   ;---------------------------------;
+0509            279   ; Receive a byte from serial port ;
+0509            280   ;---------------------------------;
+0509            281   getchar:
+0509 109802     282            jbc     RI,getchar_L1
+050C 80FB       283            sjmp getchar
+050E            284   getchar_L1:
+050E E599       285            mov     a,SBUF
+0510 22         286            ret
+0511            287   
+0511            288   ;---------------------------------;
+0511            289   ; Sends AND receives a byte via   ;
+0511            290   ; SPI.                            ;
+0511            291   ;---------------------------------;
+0511            292   Send_SPI:
+0511 F5A3       293            mov     SPI0DAT, a
+0513            294   Send_SPI_L1:
+0513 30FFFD     295            jnb     SPIF, Send_SPI_L1 ; Wait for SPI transfer complete
+0516 C2FF       296            clr SPIF ; Clear SPI complete flag 
+0518 E5A3       297            mov     a, SPI0DAT
+051A 22         298            ret
+051B            299   
+051B            300   ;---------------------------------;
+051B            301   ; SPI flash 'write enable'        ;
+051B            302   ; instruction.                    ;
+051B            303   ;---------------------------------;
+051B            304   Enable_Write:
+051B C283       305            clr FLASH_CE
+051D 7406       306            mov a, #WRITE_ENABLE
+051F 120511     307            lcall Send_SPI
+0522 D283       308            setb FLASH_CE
+0524 22         309            ret
+0525            310   
+0525            311   ;---------------------------------;
+0525            312   ; This function checks the 'write ;
+0525            313   ; in progress' bit of the SPI     ;
+0525            314   ; flash memory.                   ;
+0525            315   ;---------------------------------;
+0525            316   Check_WIP:
+0525 C283       317            clr FLASH_CE
+0527 7405       318            mov a, #READ_STATUS
+0529 120511     319            lcall Send_SPI
+052C 7455       320            mov a, #0x55
+052E 120511     321            lcall Send_SPI
+0531 D283       322            setb FLASH_CE
+0533 20E0EF     323            jb acc.0, Check_WIP ;  Check the Write in Progress bit
+0536 22         324            ret
+0537            325            
+0537            326   Init_all:
+0537            327            ; Disable WDT:
+0537 7597DE     328            mov     WDTCN, #0xDE
+053A 7597AD     329            mov     WDTCN, #0xAD
+053D            330   
+053D 75FF80     331            mov     VDM0CN, #0x80
+0540 75EF06     332            mov     RSTSRC, #0x06
+0543            333            
+0543            334            ; Switch SYSCLK to 72 MHz.  First switch to 24MHz:
+0543 75A710     335            mov     SFRPAGE, #0x10
+0546 75C120     336            mov     PFE0CN, #0x20
+0549 75A700     337            mov     SFRPAGE, #0x00
+054C 75A900     338            mov     CLKSEL, #0x00
+054F 75A900     339            mov     CLKSEL, #0x00 ; Second write to CLKSEL is required according to datasheet
+0552            340            
+0552            341            ; Wait for clock to settle at 24 MHz by checking the most significant bit of CLKSEL:
+0552            342   Init_L1:
+0552 E5A9       343            mov     a, CLKSEL
+0554 30E7FB     344            jnb     acc.7, Init_L1
+0557            345            
+0557            346            ; Now switch to 72MHz:
+0557 75A903     347            mov     CLKSEL, #0x03
+055A 75A903     348            mov     CLKSEL, #0x03  ; Second write to CLKSEL is required according to datasheet
+055D            349            
+055D            350            ; Wait for clock to settle at 72 MHz by checking the most significant bit of CLKSEL:
+055D            351   Init_L2:
+055D E5A9       352            mov     a, CLKSEL
+055F 30E7FB     353            jnb     acc.7, Init_L2
+0562            354   
+0562 75A700     355            mov     SFRPAGE, #0x00
+0565            356            
+0565            357            ; Configure P3.0 as analog output.  P3.0 pin is the output of DAC0.
+0565 53F4FE     358            anl     P3MDIN, #0xFE
+0568 43B001     359            orl     P3, #0x01
+056B            360            
+056B            361            ; Configure the pins used for SPI (P0.0 to P0.3)
+056B 75A41D     362            mov     P0MDOUT, #0x1D ; SCK, MOSI, P0.3, TX0 are push-pull, all others open-drain
+056E            363   
+056E 43D4C8     364            ORL P0SKIP, #0b11001000
+0571 43D503     365            ORL P1SKIP, #0b00000011
+0574            366   
+0574 75E103     367            mov     XBR0, #0x03 ; Enable SPI and UART0: SPI0E=1, URT0E=1
+0577 75E210     368            mov     XBR1, #0x10 
+057A 75E340     369            mov     XBR2, #0x40 ; Enable crossbar and weak pull-ups
+057D            370   
+057D            371            ; Enable serial communication and set up baud rate using timer 1
+057D 759810     372            mov     SCON0, #0x10    
+0580 758DE6     373            mov     TH1, #(0x100-((SYSCLK/BAUDRATE)/(12*2)))
+0583 858D8B     374            mov     TL1, TH1
+0586 53890F     375            anl     TMOD, #0x0F ; Clear the bits of timer 1 in TMOD
+0589 438920     376            orl     TMOD, #0x20 ; Set timer 1 in 8-bit auto-reload mode.  Don't change the bits of timer 0
+058C D28E       377            setb TR1 ; START Timer 1
+058E D299       378            setb TI ; Indicate TX0 ready
+0590            379            
+0590            380            ; Configure DAC 0
+0590 75A730     381            mov     SFRPAGE, #0x30 ; To access DAC 0 we use register page 0x30
+0593 758888     382            mov     DACGCF0, #0b_1000_1000 ; 1:D23REFSL(VCC) 1:D3AMEN(NORMAL) 2:D3SRC(DAC3H:DAC3L) 1:D01REFSL(VCC) 1:D1AMEN(NORMAL) 1:D1SRC(DAC1H:DAC1L)
+0596 759800     383            mov     DACGCF1, #0b_0000_0000
+0599 75A222     384            mov     DACGCF2, #0b_0010_0010 ; Reference buffer gain 1/3 for all channels
+059C 759180     385            mov     DAC0CF0, #0b_1000_0000 ; Enable DAC 0
+059F 759202     386            mov     DAC0CF1, #0b_0000_0010 ; DAC gain is 3.  Therefore the overall gain is 1.
+05A2            387            ; Initial value of DAC 0 is mid scale:
+05A2 758400     388            mov     DAC0L, #0x00
+05A5 758508     389            mov     DAC0H, #0x08
+05A8 75A700     390            mov     SFRPAGE, #0x00
+05AB            391            
+05AB            392            ; Configure SPI
+05AB 75A200     393            mov     SPI0CKR, #((SYSCLK/(2*F_SCK_MAX))-1)
+05AE 75A140     394            mov     SPI0CFG, #0b_0100_0000 ; SPI in master mode
+05B1 75F801     395            mov     SPI0CN0, #0b_0000_0001 ; SPI enabled and in three wire mode
+05B4 D283       396            setb FLASH_CE ; CS=1 for SPI flash memory
+05B6 C292       397            clr SPEAKER ; Turn off speaker.
+05B8            398            
+05B8            399            ; Configure Timer 2 and its interrupt
+05B8 75C800     400            mov     TMR2CN0,#0x00 ; Stop Timer2; Clear TF2
+05BB 438E10     401            orl     CKCON0,#0b_0001_0000 ; Timer 2 uses the system clock
+05BE            402            ; Initialize reload value:
+05BE 75CA3F     403            mov     TMR2RLL, #low(TIMER2_RELOAD)
+05C1 75CBF3     404            mov     TMR2RLH, #high(TIMER2_RELOAD)
+05C4            405            ; Set timer to reload immediately
+05C4 75CFFF     406            mov     TMR2H,#0xFF
+05C7 75CEFF     407            mov     TMR2L,#0xFF
+05CA D2AD       408            setb ET2 ; Enable Timer 2 interrupts
+05CC            409            ; setb TR2 ; Timer 2 is only enabled to play stored sound
+05CC            410   
+05CC            411            ;CLKSEL to 24.5 MHz
+05CC 75A900     412            mov     CLKSEL, #0x00 ; 
+05CF 75A900     413            mov     CLKSEL, #0x00 ; Second write to CLKSEL is required according to the user manual (page 77)
+05D2            414   
+05D2            415            ;Initializes timer/counter 0 as a 16-bit counter
+05D2 C28C       416       clr TR0 ; Stop timer 0
+05D4 E589       417       mov a, TMOD
+05D6 54F0       418       anl a, #0b_1111_0000 ; Clear the bits of timer/counter 0
+05D8 4405       419       orl a, #0b_0000_0101 ; Sets the bits of timer/counter 0 for a 16-bit counter
+05DA F589       420       mov TMOD, a
+05DC            421   
+05DC            422            ; Configure LCD and display initial message
+05DC 1200B8     423            lcall LCD_4BIT
+05DF C0E0       424            push acc
+05E1 7401       424            mov a, #1
+05E3 14         424            dec a
+05E4 120108     424            lcall ?Set_Cursor_1 ; Select column and row
+05E7 D0E0       424            pop acc
+05E9 C083       425            push dph
+05EB C082       425            push dpl
+05ED C0E0       425            push acc
+05EF 900393     425            mov dptr, #Msg1
+05F2 1200E4     425            lcall ?Send_Constant_String
+05F5 D0E0       425            pop acc
+05F7 D082       425            pop dpl
+05F9 D083       425            pop dph
+05FB            426   
+05FB D2AF       427            setb EA ; Enable interrupts
+05FD            428            
+05FD 22         429            ret
+05FE            430   
+05FE            431   ;---------------------------------;
+05FE            432   ; Main program. Includes hardware ;
+05FE            433   ; initialization and 'forever'    ;
+05FE            434   ; loop.                           ;
+05FE            435   ;---------------------------------;
+05FE            436   MainProgram:
+05FE 75817F     437       mov SP, #0x7f ; Setup stack pointer to the start of indirectly accessable data memory minus one
+0601 120537     438       lcall Init_all ; Initialize the hardware
+0604            439            
+0604            440   forever_loop:
+0604 75A903     441            mov     CLKSEL, #0x03 ; 
+0607 75A903     442            mov     CLKSEL, #0x03 ;
+060A 20984F     443            jb RI, serial_get
+060D 20B7F4     444            jb P3.7, forever_loop ; Check if push-button pressed
+0610 30B7FD     445            jnb P3.7, $ ; Wait for push-button release
+0613            446            ; Play the whole memory
+0613 C2CA       447            clr TR2 ; Stop Timer 2 ISR from playing previous request
+0615 D283       448            setb FLASH_CE
+0617 C292       449            clr SPEAKER ; Turn off speaker.
+0619            450            
+0619 C283       451            clr FLASH_CE ; Enable SPI Flash
+061B 7403       452            mov a, #READ_BYTES
+061D 120511     453            lcall Send_SPI
+0620            454            ; Set the initial position in memory where to start playing
+0620 7400       455            mov a, #0x00
+0622 120511     456            lcall Send_SPI
+0625 7400       457            mov a, #0x00
+0627 120511     458            lcall Send_SPI
+062A 7400       459            mov a, #0x00
+062C 120511     460            lcall Send_SPI
+062F 7400       461            mov a, #0x00 ; Request first byte to send to DAC
+0631 120511     462            lcall Send_SPI
+0634            463            
+0634            464            ; How many bytes to play? All of them!  Asume 4Mbytes memory: 0x3fffff
+0634 75323F     465            mov w+2, #0x3f
+0637 7531FF     466            mov w+1, #0xff
+063A 7530FF     467            mov w+0, #0xff
+063D            468            
+063D D292       469            setb SPEAKER ; Turn on speaker.
+063F D2CA       470            setb TR2 ; Start playback by enabling Timer 2
+0641 75A900     471            mov     CLKSEL, #0x00 ; 
+0644 75A900     472            mov     CLKSEL, #0x00 ;
+0647            473   forever_loop_2:
+0647            474            ;all lab3
+0647            475            ; Measure the frequency applied to pin T0 (T0 is routed to pin P0.0 using the 'crossbar')
+0647 C28C       476       clr TR0 ; Stop counter 0
+0649 758A00     477       mov TL0, #0
+064C 758C00     478       mov TH0, #0
+064F D28C       479       setb TR0 ; Start counter 0
+0651 120462     480       lcall Wait_one_second
+0654 C28C       481       clr TR0 ; Stop counter 0, TH0-TL0 has the frequency
+0656            482       ; gotta move TH0-TL0 into a var
+0656            483            ; Convert the result to BCD and display on LCD
+0656 1203A5     484            lcall display_c
+0659 020647     485            ljmp forever_loop_2
+065C            486            
+065C            487   serial_get:
+065C 120509     488            lcall getchar ; Wait for data to arrive
+065F B423A2     489            cjne a, #'#', forever_loop ; Message format is #n[data] where 'n' is '0' to '9'
+0662 C2CA       490            clr TR2 ; Stop Timer 2 from playing previous request
+0664 D283       491            setb FLASH_CE ; Disable SPI Flash       
+0666 C292       492            clr SPEAKER ; Turn off speaker.
+0668 120509     493            lcall getchar
+066B            494   
+066B            495   ;---------------------------------------------------------       
+066B B43024     496            cjne a, #'0' , Command_0_skip
+066E            497   Command_0_start: ; Identify command
+066E C283       498            clr FLASH_CE ; Enable SPI Flash         
+0670 749F       499            mov a, #READ_DEVICE_ID
+0672 120511     500            lcall Send_SPI  
+0675 7455       501            mov a, #0x55
+0677 120511     502            lcall Send_SPI
+067A 120501     503            lcall putchar
+067D 7455       504            mov a, #0x55
+067F 120511     505            lcall Send_SPI
+0682 120501     506            lcall putchar
+0685 7455       507            mov a, #0x55
+0687 120511     508            lcall Send_SPI
+068A 120501     509            lcall putchar
+068D D283       510            setb FLASH_CE ; Disable SPI Flash
+068F 020604     511            ljmp forever_loop       
+0692            512   Command_0_skip:
+0692            513   
+0692            514   ;---------------------------------------------------------       
+0692 B43117     515            cjne a, #'1' , Command_1_skip 
+0695            516   Command_1_start: ; Erase whole flash (takes a long time)
+0695 12051B     517            lcall Enable_Write
+0698 C283       518            clr FLASH_CE
+069A 74C7       519            mov a, #ERASE_ALL
+069C 120511     520            lcall Send_SPI
+069F D283       521            setb FLASH_CE
+06A1 120525     522            lcall Check_WIP
+06A4 7401       523            mov a, #0x01 ; Send 'I am done' reply
+06A6 120501     524            lcall putchar           
+06A9 020604     525            ljmp forever_loop       
+06AC            526   Command_1_skip:
+06AC            527   
+06AC            528   ;---------------------------------------------------------       
+06AC B43235     529            cjne a, #'2' , Command_2_skip 
+06AF            530   Command_2_start: ; Load flash page (256 bytes or less)
+06AF 12051B     531            lcall Enable_Write
+06B2 C283       532            clr FLASH_CE
+06B4 7402       533            mov a, #WRITE_BYTES
+06B6 120511     534            lcall Send_SPI
+06B9 120509     535            lcall getchar ; Address bits 16 to 23
+06BC 120511     536            lcall Send_SPI
+06BF 120509     537            lcall getchar ; Address bits 8 to 15
+06C2 120511     538            lcall Send_SPI
+06C5 120509     539            lcall getchar ; Address bits 0 to 7
+06C8 120511     540            lcall Send_SPI
+06CB 120509     541            lcall getchar ; Number of bytes to write (0 means 256 bytes)
+06CE F8         542            mov r0, a
+06CF            543   Command_2_loop:
+06CF 120509     544            lcall getchar
+06D2 120511     545            lcall Send_SPI
+06D5 D8F8       546            djnz r0, Command_2_loop
+06D7 D283       547            setb FLASH_CE
+06D9 120525     548            lcall Check_WIP
+06DC 7401       549            mov a, #0x01 ; Send 'I am done' reply
+06DE 120501     550            lcall putchar           
+06E1 020604     551            ljmp forever_loop       
+06E4            552   Command_2_skip:
+06E4            553   
+06E4            554   ;---------------------------------------------------------       
+06E4 B4332C     555            cjne a, #'3' , Command_3_skip 
+06E7            556   Command_3_start: ; Read flash bytes (256 bytes or less)
+06E7 C283       557            clr FLASH_CE
+06E9 7403       558            mov a, #READ_BYTES
+06EB 120511     559            lcall Send_SPI
+06EE 120509     560            lcall getchar ; Address bits 16 to 23
+06F1 120511     561            lcall Send_SPI
+06F4 120509     562            lcall getchar ; Address bits 8 to 15
+06F7 120511     563            lcall Send_SPI
+06FA 120509     564            lcall getchar ; Address bits 0 to 7
+06FD 120511     565            lcall Send_SPI
+0700 120509     566            lcall getchar ; Number of bytes to read and send back (0 means 256 bytes)
+0703 F8         567            mov r0, a
+0704            568   
+0704            569   Command_3_loop:
+0704 7455       570            mov a, #0x55
+0706 120511     571            lcall Send_SPI
+0709 120501     572            lcall putchar
+070C D8F6       573            djnz r0, Command_3_loop
+070E D283       574            setb FLASH_CE   
+0710 020604     575            ljmp forever_loop       
+0713            576   Command_3_skip:
+0713            577   
+0713            578   ;---------------------------------------------------------       
+0713 B43436     579            cjne a, #'4' , Command_4_skip 
+0716            580   Command_4_start: ; Playback a portion of the stored wav file
+0716 C2CA       581            clr TR2 ; Stop Timer 2 ISR from playing previous request
+0718 D283       582            setb FLASH_CE
+071A            583            
+071A C283       584            clr FLASH_CE ; Enable SPI Flash
+071C 7403       585            mov a, #READ_BYTES
+071E 120511     586            lcall Send_SPI
+0721            587            ; Get the initial position in memory where to start playing
+0721 120509     588            lcall getchar
+0724 120511     589            lcall Send_SPI
+0727 120509     590            lcall getchar
+072A 120511     591            lcall Send_SPI
+072D 120509     592            lcall getchar
+0730 120511     593            lcall Send_SPI
+0733            594            ; Get how many bytes to play
+0733 120509     595            lcall getchar
+0736 F532       596            mov w+2, a
+0738 120509     597            lcall getchar
+073B F531       598            mov w+1, a
+073D 120509     599            lcall getchar
+0740 F530       600            mov w+0, a
+0742            601            
+0742 7400       602            mov a, #0x00 ; Request first byte to send to DAC
+0744 120511     603            lcall Send_SPI
+0747            604            
+0747 D2CA       605            setb TR2 ; Start playback by enabling timer 2
+0749 020604     606            ljmp forever_loop       
+074C            607   Command_4_skip:
+074C            608   
+074C            609   ;---------------------------------------------------------       
+074C B4355C     610            cjne a, #'5' , Command_5_skip 
+074F            611   Command_5_start: ; Calculate and send CRC-16 of ISP flash memory from zero to the 24-bit passed value.
+074F            612            ; Get how many bytes to use to calculate the CRC.  Store in [r5,r4,r3]
+074F 120509     613            lcall getchar
+0752 FD         614            mov r5, a
+0753 120509     615            lcall getchar
+0756 FC         616            mov r4, a
+0757 120509     617            lcall getchar
+075A FB         618            mov r3, a
+075B            619            
+075B            620            ; Since we are using the 'djnz' instruction to check, we need to add one to each byte of the counter.
+075B            621            ; A side effect is that the down counter becomes efectively a 23-bit counter, but that is ok
+075B            622            ; because the max size of the 25Q32 SPI flash memory is 400000H.
+075B 0B         623            inc r3
+075C 0C         624            inc r4
+075D 0D         625            inc r5
+075E            626            
+075E            627            ; Initial CRC must be zero.
+075E 75A720     628            mov     SFRPAGE, #0x20 ; UART0, CRC, and SPI can work on this page
+0761 75CE08     629            mov     CRC0CN0, #0b_0000_1000 ; // Initialize hardware CRC result to zero;
+0764            630   
+0764 C283       631            clr FLASH_CE
+0766 7403       632            mov a, #READ_BYTES
+0768 120511     633            lcall Send_SPI
+076B E4         634            clr a ; Address bits 16 to 23
+076C 120511     635            lcall Send_SPI
+076F E4         636            clr a ; Address bits 8 to 15
+0770 120511     637            lcall Send_SPI
+0773 E4         638            clr a ; Address bits 0 to 7
+0774 120511     639            lcall Send_SPI
+0777 F5A3       640            mov     SPI0DAT, a ; Request first byte from SPI flash
+0779 800B       641            sjmp Command_5_loop_start
+077B            642   
+077B            643   Command_5_loop:
+077B 30FFFD     644            jnb SPIF, Command_5_loop        ; Check SPI Transfer Completion Flag
+077E C2FF       645            clr SPIF                                    ; Clear SPI Transfer Completion Flag        
+0780 E5A3       646            mov a, SPI0DAT                          ; Save received SPI byte to accumulator
+0782 F5A3       647            mov SPI0DAT, a                          ; Request next byte from SPI flash; while it arrives we calculate the CRC:
+0784 F5CA       648            mov     CRC0IN, a               ; Feed new byte to hardware CRC calculator
+0786            649   
+0786            650   Command_5_loop_start:
+0786            651            ; Drecrement counter:
+0786 DBF3       652            djnz r3, Command_5_loop
+0788 DCF1       653            djnz r4, Command_5_loop
+078A DDEF       654            djnz r5, Command_5_loop
+078C            655   Command_5_loop2:         
+078C 30FFFD     656            jnb SPIF, Command_5_loop2       ; Check SPI Transfer Completion Flag
+078F C2FF       657            clr SPIF                                ; Clear SPI Transfer Completion Flag
+0791 E5A3       658            mov a, SPI0DAT              ; This dummy read is needed otherwise next transfer fails (why?)
+0793 D283       659            setb FLASH_CE                           ; Done reading from SPI flash
+0795            660            
+0795            661            ; Computation of CRC is complete.  Send 16-bit result using the serial port
+0795 75CE01     662            mov     CRC0CN0, #0x01 ; Set bit to read hardware CRC high byte
+0798 E5CB       663            mov     a, CRC0DAT
+079A 120501     664            lcall putchar
+079D            665   
+079D 75CE00     666            mov     CRC0CN0, #0x00 ; Clear bit to read hardware CRC low byte
+07A0 E5CB       667            mov     a, CRC0DAT
+07A2 120501     668            lcall putchar
+07A5            669            
+07A5 75A700     670            mov     SFRPAGE, #0x00
+07A8            671   
+07A8 020604     672            ljmp forever_loop       
+07AB            673   Command_5_skip:
+07AB            674   
+07AB            675   ;---------------------------------------------------------       
+07AB B43635     676            cjne a, #'6' , Command_6_skip 
+07AE            677   Command_6_start: ; Fill flash page (256 bytes)
+07AE 12051B     678            lcall Enable_Write
+07B1 C283       679            clr FLASH_CE
+07B3 7402       680            mov a, #WRITE_BYTES
+07B5 120511     681            lcall Send_SPI
+07B8 120509     682            lcall getchar ; Address bits 16 to 23
+07BB 120511     683            lcall Send_SPI
+07BE 120509     684            lcall getchar ; Address bits 8 to 15
+07C1 120511     685            lcall Send_SPI
+07C4 120509     686            lcall getchar ; Address bits 0 to 7
+07C7 120511     687            lcall Send_SPI
+07CA 120509     688            lcall getchar ; Byte to write
+07CD F9         689            mov r1, a
+07CE 7800       690            mov r0, #0 ; 256 bytes
+07D0            691   Command_6_loop:
+07D0 E9         692            mov a, r1
+07D1 120511     693            lcall Send_SPI
+07D4 D8FA       694            djnz r0, Command_6_loop
+07D6 D283       695            setb FLASH_CE
+07D8 120525     696            lcall Check_WIP
+07DB 7401       697            mov a, #0x01 ; Send 'I am done' reply
+07DD 120501     698            lcall putchar           
+07E0 020604     699            ljmp forever_loop       
+07E3            700   Command_6_skip:
+07E3            701   
+07E3 020604     702            ljmp forever_loop
+07E6            703   
+07E6            704   END
